@@ -243,6 +243,13 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 	}
 	specialPlan, hasSpecialPlan := channelconstant.ChannelSpecialBases[baseUrl]
 
+	// Seedream 模型走图片生成接口
+	if strings.Contains(strings.ToLower(info.UpstreamModelName), "seedream") {
+		if info.RelayMode == constant.RelayModeChatCompletions {
+			info.RelayMode = constant.RelayModeImagesGenerations
+		}
+	}
+
 	switch info.RelayFormat {
 	case types.RelayFormatClaude:
 		if hasSpecialPlan && specialPlan.ClaudeBaseURL != "" {
@@ -305,6 +312,26 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *rel
 func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) (any, error) {
 	if request == nil {
 		return nil, errors.New("request is nil")
+	}
+
+	// Seedream 模型：从聊天消息中提取 prompt，转为图片生成请求
+	if strings.Contains(strings.ToLower(info.UpstreamModelName), "seedream") {
+		prompt := ""
+		for _, msg := range request.Messages {
+			if msg.Role == "user" {
+				if s, ok := msg.Content.(string); ok {
+					prompt = s
+				}
+			}
+		}
+		if prompt != "" {
+			return &dto.ImageRequest{
+				Model:  request.Model,
+				Prompt: prompt,
+				N:      lo.ToPtr(uint(1)),
+				Size:   "2048x2048",
+			}, nil
+		}
 	}
 
 	if !model_setting.ShouldPreserveThinkingSuffix(info.OriginModelName) &&

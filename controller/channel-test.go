@@ -65,7 +65,6 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 		constant.ChannelTypeSunoAPI,
 		constant.ChannelTypeKling,
 		constant.ChannelTypeJimeng,
-		constant.ChannelTypeDoubaoVideo,
 		constant.ChannelTypeVidu,
 	}
 	if lo.Contains(unsupportedTestChannelTypes, channel.Type) {
@@ -120,6 +119,10 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 		// VolcEngine 图像生成模型
 		if channel.Type == constant.ChannelTypeVolcEngine && strings.Contains(testModel, "seedream") {
 			requestPath = "/v1/images/generations"
+		}
+		// DoubaoVideo 视频生成模型
+		if channel.Type == constant.ChannelTypeDoubaoVideo || strings.Contains(strings.ToLower(testModel), "seedance") {
+			requestPath = "/v1/video/generations"
 		}
 
 		// responses-only models
@@ -188,6 +191,8 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 			relayFormat = types.RelayFormatRerank
 		case constant.EndpointTypeImageGeneration:
 			relayFormat = types.RelayFormatOpenAIImage
+		case constant.EndpointTypeVideoGeneration:
+			relayFormat = types.RelayFormatTask
 		case constant.EndpointTypeEmbeddings:
 			relayFormat = types.RelayFormatEmbedding
 		default:
@@ -201,6 +206,9 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 		}
 		if c.Request.URL.Path == "/v1/images/generations" {
 			relayFormat = types.RelayFormatOpenAIImage
+		}
+		if c.Request.URL.Path == "/v1/video/generations" {
+			relayFormat = types.RelayFormatTask
 		}
 		if c.Request.URL.Path == "/v1/messages" {
 			relayFormat = types.RelayFormatClaude
@@ -221,7 +229,23 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 
 	request := buildTestRequest(testModel, endpointType, channel, isStream)
 
-	info, err := relaycommon.GenRelayInfo(c, relayFormat, request, nil)
+	// 视频生成等 task 类型请求的特殊处理：构造 task 格式的请求体
+	isTaskRequest := relayFormat == types.RelayFormatTask
+	if isTaskRequest {
+		taskBody := map[string]interface{}{
+			"model":  testModel,
+			"prompt": "a cute cat playing",
+		}
+		jsonData, _ := common.Marshal(taskBody)
+		c.Request.Body = io.NopCloser(bytes.NewBuffer(jsonData))
+	}
+
+	var info *relaycommon.RelayInfo
+	if isTaskRequest {
+		info, err = relaycommon.GenRelayInfo(c, relayFormat, nil, nil)
+	} else {
+		info, err = relaycommon.GenRelayInfo(c, relayFormat, request, nil)
+	}
 
 	if err != nil {
 		return testResult{
@@ -234,29 +258,90 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 	info.IsChannelTest = true
 	info.InitChannelMeta(c)
 
-	err = attachTestBillingRequestInput(info, request)
-	if err != nil {
-		return testResult{
-			context:     c,
-			localErr:    err,
-			newAPIError: types.NewError(err, types.ErrorCodeJsonMarshalFailed),
+	if !isTaskRequest {
+		err = attachTestBillingRequestInput(info, request)
+		if err != nil {
+			return testResult{
+				context:     c,
+				localErr:    err,
+				newAPIError: types.NewError(err, types.ErrorCodeJsonMarshalFailed),
+			}
 		}
-	}
 
-	err = helper.ModelMappedHelper(c, info, request)
-	if err != nil {
-		return testResult{
-			context:     c,
-			localErr:    err,
-			newAPIError: types.NewError(err, types.ErrorCodeChannelModelMappedError),
+		err = helper.ModelMappedHelper(c, info, request)
+		if err != nil {
+			return testResult{
+				context:     c,
+				localErr:    err,
+				newAPIError: types.NewError(err, types.ErrorCodeChannelModelMappedError),
+			}
 		}
-	}
 
-	testModel = info.UpstreamModelName
-	// 更新请求中的模型名称
-	request.SetModelName(testModel)
+		testModel = info.UpstreamModelName
+		// 更新请求中的模型名称
+		request.SetModelName(testModel)
+	} else {
+		testModel = info.UpstreamModelName
+	}
 
 	apiType, _ := common.ChannelType2APIType(channel.Type)
+
+	// 对于 task 类型请求，使用 GetTaskAdaptor 获取正确的适配器
+	if isTaskRequest {
+		taskAdaptor := relay.GetTaskAdaptor(constant.TaskPlatform(strconv.Itoa(channel.Type)))
+		if taskAdaptor == nil {
+			return testResult{
+				context:     c,
+				localErr:    fmt.Errorf("channel type %d does not support task requests", channel.Type),
+				newAPIError: types.NewError(fmt.Errorf("unsupported channel type for task requests"), types.ErrorCodeInvalidApiType),
+			}
+		}
+		taskAdaptor.Init(info)
+		// 调用适配器的 ValidateRequestAndSetAction 解析请求体
+		if taskErr := taskAdaptor.ValidateRequestAndSetAction(c, info); taskErr != nil {
+			return testResult{
+				context:     c,
+				localErr:    fmt.Errorf("channel type %d does not support task requests", channel.Type),
+				newAPIError: types.NewError(fmt.Errorf("unsupported channel type for task requests"), types.ErrorCodeInvalidApiType),
+			}
+		}
+		// 调用适配器的 ValidateRequestAndSetAction 解析请求体
+		if taskErr := taskAdaptor.ValidateRequestAndSetAction(c, info); taskErr != nil {
+			return testResult{
+				context:     c,
+				localErr:    fmt.Errorf("%s", taskErr.Message),
+				newAPIError: types.NewError(fmt.Errorf("%s", taskErr.Message), types.ErrorCodeInvalidRequest),
+			}
+		}
+		// 调用适配器的 BuildRequestBody 转换请求体
+		requestBody, buildErr := taskAdaptor.BuildRequestBody(c, info)
+		if buildErr != nil {
+			return testResult{
+				context:     c,
+				localErr:    buildErr,
+				newAPIError: types.NewError(buildErr, types.ErrorCodeConvertRequestFailed),
+			}
+		}
+		// 直接使用转换后的请求体
+		httpResp, doErr := taskAdaptor.DoRequest(c, info, requestBody)
+		if doErr != nil {
+			return testResult{
+				context:     c,
+				localErr:    doErr,
+				newAPIError: types.NewOpenAIError(doErr, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError),
+			}
+		}
+		if httpResp != nil && httpResp.StatusCode != http.StatusOK {
+			respBody, _ := io.ReadAll(httpResp.Body)
+			return testResult{
+				context:     c,
+				localErr:    fmt.Errorf("bad response status code %d, body: %s", httpResp.StatusCode, string(respBody)),
+			}
+		}
+		// 成功
+		return testResult{context: c}
+	}
+
 	if info.RelayMode == relayconstant.RelayModeResponsesCompact &&
 		apiType != constant.APITypeOpenAI &&
 		apiType != constant.APITypeCodex {
@@ -699,6 +784,14 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 				N:      lo.ToPtr(uint(1)),
 				Size:   "1024x1024",
 			}
+		case constant.EndpointTypeVideoGeneration:
+			// 返回 GeneralOpenAIRequest (task 类型请求体由上下文设置)
+			return &dto.GeneralOpenAIRequest{
+				Model: model,
+				Messages: []dto.Message{
+					{Role: "user", Content: "a cute cat playing"},
+				},
+			}
 		case constant.EndpointTypeJinaRerank:
 			// 返回 RerankRequest
 			return &dto.RerankRequest{
@@ -762,6 +855,26 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 		return &dto.EmbeddingRequest{
 			Model: model,
 			Input: []any{"hello world"},
+		}
+	}
+
+	// VolcEngine 图像生成模型 (seedream)
+	if strings.Contains(strings.ToLower(model), "seedream") {
+		return &dto.ImageRequest{
+			Model:  model,
+			Prompt: "a cute cat",
+			N:      lo.ToPtr(uint(1)),
+			Size:   "2048x2048",
+		}
+	}
+
+	// 视频生成模型 (seedance) - 返回 GeneralOpenAIRequest 作为载体
+	if strings.Contains(strings.ToLower(model), "seedance") {
+		return &dto.GeneralOpenAIRequest{
+			Model: model,
+			Messages: []dto.Message{
+				{Role: "user", Content: "a cute cat playing"},
+			},
 		}
 	}
 
